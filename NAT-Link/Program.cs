@@ -1,9 +1,13 @@
 using System;
 using System.Net;
+using System.Net.Quic;
+using System.Net.Security;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
+using System.Security.Cryptography;
 
 class Program
 {
@@ -138,9 +142,16 @@ public class StunClient
 
 public class P2PClient
 {
-    private readonly ConcurrentDictionary<string, TcpClient> connections = new();
-    private TcpListener? listener;
+    private readonly ConcurrentDictionary<string, QuicConnection> connections = new();
+    private QuicListener? listener;
     private IPEndPoint? publicEndPoint;
+    private X509Certificate2 serverCertificate;
+
+    public P2PClient()
+    {
+        // 生成自签名证书（生产环境应使用正式证书）
+        serverCertificate = GenerateSelfSignedCertificate();
+    }
 
     public async Task StartAsync()
     {
@@ -148,9 +159,29 @@ public class P2PClient
         publicEndPoint = await StunClient.GetPublicEndPoint();
         Console.WriteLine($"Your public address: {publicEndPoint}");
 
-        // 启动监听
-        listener = new TcpListener(IPAddress.Any, publicEndPoint.Port);
-        listener.Start();
+        // 启动 QUIC 监听
+        var listenerOptions = new QuicListenerOptions
+        {
+            ListenEndPoint = new IPEndPoint(IPAddress.Any, publicEndPoint.Port),
+            ApplicationProtocols = new List<SslApplicationProtocol>
+            {
+                SslApplicationProtocol.Http3
+            },
+            ConnectionOptionsCallback = (_, _, _) =>
+            {
+                var serverOptions = new QuicServerConnectionOptions
+                {
+                    ServerAuthenticationOptions = new SslServerAuthenticationOptions
+                    {
+                        ServerCertificate = serverCertificate,
+                        ClientCertificateRequired = false
+                    }
+                };
+                return ValueTask.FromResult(serverOptions);
+            }
+        };
+
+        listener = await QuicListener.ListenAsync(listenerOptions);
         _ = ListenForConnectionsAsync();
 
         while (true)
@@ -182,25 +213,32 @@ public class P2PClient
     {
         while (true)
         {
-            var client = await listener!.AcceptTcpClientAsync();
-            _ = HandleIncomingConnection(client);
+            try
+            {
+                var connection = await listener.AcceptConnectionAsync();
+                _ = HandleIncomingConnection(connection);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Accept connection failed: {ex.Message}");
+            }
         }
     }
 
-    private async Task HandleIncomingConnection(TcpClient client)
+    private async Task HandleIncomingConnection(QuicConnection connection)
     {
-        var endpoint = client.Client.RemoteEndPoint?.ToString();
+        var endpoint = connection.RemoteEndPoint?.ToString();
         Console.WriteLine($"Incoming connection from {endpoint}. Accept? [Y/N]");
 
         if (Console.ReadKey(true).Key == ConsoleKey.Y)
         {
-            connections[endpoint!] = client;
-            _ = ReceiveMessagesAsync(client);
+            connections[endpoint!] = connection;
+            _ = ReceiveMessagesAsync(connection);
             Console.WriteLine($"Connected to {endpoint}");
         }
         else
         {
-            client.Dispose();
+            await connection.CloseAsync(0);
         }
     }
 
@@ -215,46 +253,67 @@ public class P2PClient
             return;
         }
 
-        var client = new TcpClient();
         try
         {
-            await client.ConnectAsync(remoteEP.Address, remoteEP.Port);
-            connections[remoteEP.ToString()!] = client;
-            _ = ReceiveMessagesAsync(client);
+            var clientOptions = new QuicClientConnectionOptions
+            {
+                RemoteEndPoint = remoteEP,
+                ClientAuthenticationOptions = new SslClientAuthenticationOptions
+                {
+                    ApplicationProtocols = new List<SslApplicationProtocol>
+        {
+            SslApplicationProtocol.Http3
+        },
+                    RemoteCertificateValidationCallback = (_, cert, _, errors) =>
+                    {
+                        // 这里可以添加自定义证书验证逻辑
+                        return errors == SslPolicyErrors.None;
+                    }
+                },
+                DefaultStreamErrorCode = 1,
+                DefaultCloseErrorCode = 1
+            };
+
+            var connection = await QuicConnection.ConnectAsync(clientOptions);
+            connections[remoteEP.ToString()!] = connection;
+            _ = ReceiveMessagesAsync(connection);
             Console.WriteLine($"Connected to {remoteEP}");
         }
         catch (Exception ex)
         {
             Console.WriteLine($"Connection failed: {ex.Message}");
-            client.Dispose();
         }
     }
 
-    private async Task ReceiveMessagesAsync(TcpClient client)
+    private async Task ReceiveMessagesAsync(QuicConnection connection)
     {
-        var stream = client.GetStream();
-        var buffer = new byte[1024];
-        var endpoint = client.Client.RemoteEndPoint?.ToString();
+        var endpoint = connection.RemoteEndPoint?.ToString();
 
         try
         {
             while (true)
             {
-                var bytesRead = await stream.ReadAsync(buffer);
-                if (bytesRead == 0) break;
+                await using var stream = await connection.AcceptInboundStreamAsync();
+                var buffer = new byte[1024];
 
-                var message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                Console.WriteLine($"\n[{endpoint}]: {message}");
+                while (true)
+                {
+                    var bytesRead = await stream.ReadAsync(buffer);
+                    if (bytesRead == 0) break;
+
+                    var message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
+                    Console.WriteLine($"\n[{endpoint}]: {message}");
+                }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Connection closed
+            Console.WriteLine($"Connection error ({endpoint}): {ex.Message}");
         }
 
         Console.WriteLine($"\nConnection closed: {endpoint}");
         connections.TryRemove(endpoint!, out _);
-        client.Dispose();
+        await connection.CloseAsync(0);
     }
 
     private async Task HandleSendCommand()
@@ -267,17 +326,19 @@ public class P2PClient
 
         var data = Encoding.UTF8.GetBytes(message!);
 
-        foreach (var (endpoint, client) in connections)
+        foreach (var (endpoint, connection) in connections)
         {
             if (string.IsNullOrEmpty(recipient) || endpoint == recipient)
             {
                 try
                 {
-                    await client.GetStream().WriteAsync(data);
+                    // 修改此行，添加流类型参数
+                    await using var stream = await connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional);
+                    await stream.WriteAsync(data);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    Console.WriteLine($"Failed to send to {endpoint}");
+                    Console.WriteLine($"Failed to send to {endpoint}: {ex.Message}");
                 }
             }
         }
@@ -297,14 +358,31 @@ public class P2PClient
         Console.Write("Enter address to disconnect: ");
         var address = Console.ReadLine();
 
-        if (connections.TryRemove(address!, out var client))
+        if (connections.TryRemove(address!, out var connection))
         {
-            client.Dispose();
+            // 修改此处为异步等待
+            connection.CloseAsync(0).ConfigureAwait(false).GetAwaiter().GetResult();
             Console.WriteLine($"Disconnected from {address}");
         }
         else
         {
             Console.WriteLine("Connection not found");
         }
+    }
+
+    private static X509Certificate2 GenerateSelfSignedCertificate()
+    {
+        using var rsa = RSA.Create(2048);
+        var certRequest = new CertificateRequest(
+            "CN=localhost",
+            rsa,
+            HashAlgorithmName.SHA256,
+            RSASignaturePadding.Pkcs1);
+
+        var certificate = certRequest.CreateSelfSigned(
+            DateTimeOffset.Now,
+            DateTimeOffset.Now.AddYears(1));
+
+        return new X509Certificate2(certificate.Export(X509ContentType.Pfx));
     }
 }
