@@ -1,388 +1,229 @@
 using System;
 using System.Net;
-using System.Net.Quic;
-using System.Net.Security;
 using System.Net.Sockets;
-using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Collections.Concurrent;
-using System.Security.Cryptography;
+using STUN;
+using System.Runtime.CompilerServices;
 
-class Program
+public class NATPunchthroughClient
 {
-    static async Task Main(string[] args)
+    private Socket _listener;
+    private readonly ConcurrentDictionary<string, TcpClient> _connections = new();
+    private CancellationTokenSource _cts = new();
+
+    public async Task StartClientAsync(IPEndPoint StunServer)
     {
-        var client = new P2PClient();
-        await client.StartAsync();
-    }
-}
-
-public class StunClient
-{
-    // STUN 消息类型
-    private const ushort BindingRequest = 0x0001;
-    private const ushort BindingResponse = 0x0101;
-
-    // STUN 属性类型
-    private const ushort MappedAddress = 0x0001;
-    private const ushort XorMappedAddress = 0x0020;
-
-    // STUN Magic Cookie
-    private static readonly byte[] MagicCookie = { 0x21, 0x12, 0xA4, 0x42 };
-
-    public async static Task<IPEndPoint> GetPublicEndPoint(string stunServer = "stun.miwifi.com", int port = 3478)
-    {
-        using (var udpClient = new UdpClient())
+        try
         {
-            udpClient.Connect(stunServer, port);
+            // 获取公网端点信息
+            var publicEP = await GetPublicEndPoint(StunServer);
+            Console.WriteLine($"Public endpoint: {publicEP.Item1}");
 
-            // 创建 STUN 绑定请求
-            var request = CreateBindingRequest();
-            await udpClient.SendAsync(request, request.Length);
+            // 启动本地监听
+            _listener = publicEP.Item2.BeginAccept(new AsyncCallback(OnConnect),this);
+            //_ = Task.Run(() => ListenForIncomingConnections());
 
-            // 设置超时时间（3秒）
-            var asyncResult = udpClient.BeginReceive(null, null);
-            asyncResult.AsyncWaitHandle.WaitOne(3000);
-            if (!asyncResult.IsCompleted)
+            // 主命令循环
+            while (!_cts.IsCancellationRequested)
             {
-                throw new TimeoutException("STUN server response timed out");
-            }
+                Console.Write("> ");
+                var input = Console.ReadLine();
 
-            // 接收响应
-            IPEndPoint remoteEP = null;
-            byte[] response = udpClient.EndReceive(asyncResult, ref remoteEP);
-
-            return ParseStunResponse(response);
-        }
-    }
-
-    private static byte[] CreateBindingRequest()
-    {
-        byte[] transactionId = GenerateTransactionId();
-
-        var message = new byte[20]; // STUN 头部长度 20 字节
-        // 消息类型（Binding Request）
-        Buffer.BlockCopy(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)BindingRequest)), 0, message, 0, 2);
-        // 消息长度（无属性）
-        Buffer.BlockCopy(BitConverter.GetBytes(IPAddress.HostToNetworkOrder((short)0)), 0, message, 2, 2);
-        // Magic Cookie
-        Buffer.BlockCopy(MagicCookie, 0, message, 4, 4);
-        // Transaction ID (12 bytes)
-        Buffer.BlockCopy(transactionId, 0, message, 8, 12);
-
-        return message;
-    }
-
-    private static IPEndPoint ParseStunResponse(byte[] response)
-    {
-        // 验证响应头
-        if (response.Length < 20)
-            throw new ArgumentException("Invalid STUN response");
-
-        // 检查 Magic Cookie
-        for (int i = 4; i < 8; i++)
-        {
-            if (response[i] != MagicCookie[i - 4])
-                throw new ArgumentException("Invalid STUN response");
-        }
-
-        int offset = 20; // 跳过头部
-
-        while (offset < response.Length)
-        {
-            ushort attributeType = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(response, offset));
-            ushort attributeLength = (ushort)IPAddress.NetworkToHostOrder(BitConverter.ToInt16(response, offset + 2));
-            offset += 4;
-
-            if (attributeType == XorMappedAddress || attributeType == MappedAddress)
-            {
-                return ParseAddressAttribute(response, offset, attributeLength);
-            }
-
-            offset += attributeLength;
-        }
-
-        throw new ArgumentException("No valid address found in STUN response");
-    }
-
-    private static IPEndPoint ParseAddressAttribute(byte[] data, int offset, ushort length)
-    {
-        int port = data[offset + 2] << 8 | data[offset + 3];
-        byte[] addressBytes;
-
-        // IPv4
-        if (data[offset + 1] == 0x01)
-        {
-            addressBytes = new byte[4];
-            Buffer.BlockCopy(data, offset + 4, addressBytes, 0, 4);
-
-            // 如果是 XOR-MAPPED-ADDRESS，需要异或处理
-            if (data[offset] == 0x00 && data[offset + 1] == 0x20)
-            {
-                port ^= (MagicCookie[0] << 8) | MagicCookie[1];
-                for (int i = 0; i < 4; i++)
-                    addressBytes[i] ^= MagicCookie[i];
-            }
-
-            return new IPEndPoint(new IPAddress(addressBytes), port);
-        }
-
-        // IPv6（示例未完全实现）
-        throw new NotSupportedException("IPv6 is not supported in this example");
-    }
-
-    private static byte[] GenerateTransactionId()
-    {
-        var id = new byte[12];
-        new Random().NextBytes(id);
-        return id;
-    }
-}
-
-public class P2PClient
-{
-    private readonly ConcurrentDictionary<string, QuicConnection> connections = new();
-    private QuicListener? listener;
-    private IPEndPoint? publicEndPoint;
-    private X509Certificate2 serverCertificate;
-
-    public P2PClient()
-    {
-        // 生成自签名证书（生产环境应使用正式证书）
-        serverCertificate = GenerateSelfSignedCertificate();
-    }
-
-    public async Task StartAsync()
-    {
-        // 获取公网地址
-        publicEndPoint = await StunClient.GetPublicEndPoint();
-        Console.WriteLine($"Your public address: {publicEndPoint}");
-
-        // 启动 QUIC 监听
-        var listenerOptions = new QuicListenerOptions
-        {
-            ListenEndPoint = new IPEndPoint(IPAddress.Any, publicEndPoint.Port),
-            ApplicationProtocols = new List<SslApplicationProtocol>
-            {
-                SslApplicationProtocol.Http3
-            },
-            ConnectionOptionsCallback = (_, _, _) =>
-            {
-                var serverOptions = new QuicServerConnectionOptions
+                switch (input)
                 {
-                    ServerAuthenticationOptions = new SslServerAuthenticationOptions
-                    {
-                        ServerCertificate = serverCertificate,
-                        ClientCertificateRequired = false
-                    }
-                };
-                return ValueTask.FromResult(serverOptions);
+                    case "connect":
+                        Console.Write("请输入地址：");
+                        var parts = Console.ReadLine().Trim();
+                        IPEndPoint res;
+                        if (IPEndPoint.TryParse(parts, out res))
+                        {
+                            await ConnectToPeer(res.Address.ToString(), res.Port);
+                        }
+                        else
+                        {
+                            Console.WriteLine("错误的地址格式");
+                        }
+                        break;
+                    case "disconnect":
+                        Console.Write("请输入地址：");
+                        var addr = Console.ReadLine().Trim();
+                        if (_connections.TryRemove(addr, out var client))
+                        {
+                            client.Close();
+                            Console.WriteLine("已断开指定连接");
+                        }
+                        else
+                        {
+                            Console.WriteLine("未找到连接");
+                        }
+                        break;
+                    case "list":
+                        foreach (var key in _connections.Keys)
+                        {
+                            Console.WriteLine(key);
+                        }
+                        break;
+                    default:
+                        if (input == "exit")
+                        {
+                            break;
+                        }
+                        else
+                        {
+                            await BroadcastMessage(input);
+                        }
+                        break;
+                }
+                
             }
-        };
-
-        listener = await QuicListener.ListenAsync(listenerOptions);
-        _ = ListenForConnectionsAsync();
-
-        while (true)
+        }
+        finally
         {
-            Console.WriteLine("\nCommands: [connect] [list] [send] [disconnect] [exit]");
-            var input = Console.ReadLine()?.Trim().ToLower();
-
-            switch (input)
-            {
-                case "connect":
-                    await HandleConnectCommand();
-                    break;
-                case "list":
-                    ListConnections();
-                    break;
-                case "send":
-                    await HandleSendCommand();
-                    break;
-                case "disconnect":
-                    HandleDisconnectCommand();
-                    break;
-                case "exit":
-                    return;
-            }
+            Cleanup();
         }
     }
 
-    private async Task ListenForConnectionsAsync()
+    private void OnConnect(IAsyncResult iar)
     {
-        while (true)
+        Socket client = (Socket)iar.AsyncState;
+        try
         {
+            var _newSocket =  client.Accept();
+            _newSocket.Send(Encoding.UTF8.GetBytes("Accepted"));
+        }
+        catch (Exception e)
+        {
+            Console.WriteLine(e.ToString());
+        }
+    }
+
+    //private async Task ListenForIncomingConnections()
+    //{
+    //    while (!_cts.IsCancellationRequested)
+    //    {
+    //        var client = await _listener.AcceptTcpClientAsync();
+    //        Console.WriteLine($"收到来自 {client.Client.RemoteEndPoint} 的连接请求");
+
+    //        Console.WriteLine("已接受连接请求");
+    //        var key = ((IPEndPoint)client.Client.RemoteEndPoint).ToString();
+    //        _connections.TryAdd(key, client);
+    //        _ = Task.Run(() => HandleClient(client));
+    //        await client.Client.SendAsync(Encoding.UTF8.GetBytes("Accepted"));
+    //    }
+    //}
+
+    private async Task HandleClient(TcpClient client)
+    {
+        using (client)
+        using (var stream = client.GetStream())
+        {
+            var buffer = new byte[4096];
             try
             {
-                var connection = await listener.AcceptConnectionAsync();
-                _ = HandleIncomingConnection(connection);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Accept connection failed: {ex.Message}");
-            }
-        }
-    }
-
-    private async Task HandleIncomingConnection(QuicConnection connection)
-    {
-        var endpoint = connection.RemoteEndPoint?.ToString();
-        Console.WriteLine($"Incoming connection from {endpoint}. Accept? [Y/N]");
-
-        if (Console.ReadKey(true).Key == ConsoleKey.Y)
-        {
-            connections[endpoint!] = connection;
-            _ = ReceiveMessagesAsync(connection);
-            Console.WriteLine($"Connected to {endpoint}");
-        }
-        else
-        {
-            await connection.CloseAsync(0);
-        }
-    }
-
-    private async Task HandleConnectCommand()
-    {
-        Console.Write("Enter remote address (IP:port): ");
-        var address = Console.ReadLine();
-
-        if (!IPEndPoint.TryParse(address, out var remoteEP))
-        {
-            Console.WriteLine("Invalid address format");
-            return;
-        }
-
-        try
-        {
-            var clientOptions = new QuicClientConnectionOptions
-            {
-                RemoteEndPoint = remoteEP,
-                ClientAuthenticationOptions = new SslClientAuthenticationOptions
+                // 心跳包发送
+                var heartbeatTask = Task.Run(async () =>
                 {
-                    ApplicationProtocols = new List<SslApplicationProtocol>
-        {
-            SslApplicationProtocol.Http3
-        },
-                    RemoteCertificateValidationCallback = (_, cert, _, errors) =>
+                    while (client.Connected)
                     {
-                        // 这里可以添加自定义证书验证逻辑
-                        return errors == SslPolicyErrors.None;
+                        await Task.Delay(30000);
+                        await stream.WriteAsync(Encoding.UTF8.GetBytes("\u0000"), _cts.Token);
                     }
-                },
-                DefaultStreamErrorCode = 1,
-                DefaultCloseErrorCode = 1
-            };
+                });
 
-            var connection = await QuicConnection.ConnectAsync(clientOptions);
-            connections[remoteEP.ToString()!] = connection;
-            _ = ReceiveMessagesAsync(connection);
-            Console.WriteLine($"Connected to {remoteEP}");
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"Connection failed: {ex.Message}");
-        }
-    }
-
-    private async Task ReceiveMessagesAsync(QuicConnection connection)
-    {
-        var endpoint = connection.RemoteEndPoint?.ToString();
-
-        try
-        {
-            while (true)
-            {
-                await using var stream = await connection.AcceptInboundStreamAsync();
-                var buffer = new byte[1024];
-
-                while (true)
+                while (client.Connected)
                 {
-                    var bytesRead = await stream.ReadAsync(buffer);
+                    var bytesRead = await stream.ReadAsync(buffer, _cts.Token);
                     if (bytesRead == 0) break;
 
                     var message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                    Console.WriteLine($"\n[{endpoint}]: {message}");
+                    if (message == "\u0000") continue;  // 过滤心跳包
+
+                    if (message == "Accepted") Console.WriteLine("对方已同意连接");
+
+                    Console.WriteLine($"Received: {message}");
                 }
+            }
+            catch (IOException)
+            {
+                Console.WriteLine($"用户 {client.Client.RemoteEndPoint} 断开的自己的连接");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"连接出错： {ex}");
+            }
+            finally
+            {
+                _connections.TryRemove(((IPEndPoint)client.Client.RemoteEndPoint).ToString(), out _);
+            }
+        }
+    }
+
+    private async Task ConnectToPeer(string ip, int port)
+    {
+        var client = new TcpClient();
+        try
+        {
+            await client.ConnectAsync(ip, port);
+            if (client.Connected)
+            {
+                var key = ((IPEndPoint)client.Client.RemoteEndPoint).ToString();
+                _connections.TryAdd(key, client);
+                _ = Task.Run(() => HandleClient(client));
+                Console.WriteLine("等待对方同意");
             }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Connection error ({endpoint}): {ex.Message}");
+            Console.WriteLine($"连接失败： {ex.Message}");
+            client.Close();
         }
-
-        Console.WriteLine($"\nConnection closed: {endpoint}");
-        connections.TryRemove(endpoint!, out _);
-        await connection.CloseAsync(0);
     }
 
-    private async Task HandleSendCommand()
+    private async Task BroadcastMessage(string message)
     {
-        Console.Write("Enter message: ");
-        var message = Console.ReadLine();
+        if (string.IsNullOrWhiteSpace(message)) return;
 
-        Console.Write("Recipient address (leave empty for all): ");
-        var recipient = Console.ReadLine();
-
-        var data = Encoding.UTF8.GetBytes(message!);
-
-        foreach (var (endpoint, connection) in connections)
+        var data = Encoding.UTF8.GetBytes(message);
+        foreach (var (key, client) in _connections)
         {
-            if (string.IsNullOrEmpty(recipient) || endpoint == recipient)
+            try
             {
-                try
+                if (client.Connected)
                 {
-                    // 修改此行，添加流类型参数
-                    await using var stream = await connection.OpenOutboundStreamAsync(QuicStreamType.Unidirectional);
-                    await stream.WriteAsync(data);
+                    await client.GetStream().WriteAsync(data, 0, data.Length, _cts.Token);
                 }
-                catch (Exception ex)
-                {
-                    Console.WriteLine($"Failed to send to {endpoint}: {ex.Message}");
-                }
+            }
+            catch
+            {
+                _connections.TryRemove(key, out _);
             }
         }
     }
 
-    private void ListConnections()
+    private async Task<(EndPoint,Socket)> GetPublicEndPoint(IPEndPoint StunServer)
     {
-        Console.WriteLine("Active connections:");
-        foreach (var endpoint in connections.Keys)
+        var res = await STUN.STUNClient.QueryAsync(StunServer, STUN.STUNQueryType.PublicIP,false);
+        return (res.PublicEndPoint,res.Socket);
+    }
+
+    private void Cleanup()
+    {
+        _cts.Cancel();
+        _listener?.Close();
+        foreach (var client in _connections.Values)
         {
-            Console.WriteLine($"- {endpoint}");
+            client.Close();
         }
     }
 
-    private void HandleDisconnectCommand()
+    public static async Task Main(string[] args)
     {
-        Console.Write("Enter address to disconnect: ");
-        var address = Console.ReadLine();
-
-        if (connections.TryRemove(address!, out var connection))
-        {
-            // 修改此处为异步等待
-            connection.CloseAsync(0).ConfigureAwait(false).GetAwaiter().GetResult();
-            Console.WriteLine($"Disconnected from {address}");
-        }
-        else
-        {
-            Console.WriteLine("Connection not found");
-        }
-    }
-
-    private static X509Certificate2 GenerateSelfSignedCertificate()
-    {
-        using var rsa = RSA.Create(2048);
-        var certRequest = new CertificateRequest(
-            "CN=localhost",
-            rsa,
-            HashAlgorithmName.SHA256,
-            RSASignaturePadding.Pkcs1);
-
-        var certificate = certRequest.CreateSelfSigned(
-            DateTimeOffset.Now,
-            DateTimeOffset.Now.AddYears(1));
-
-        return new X509Certificate2(certificate.Export(X509ContentType.Pfx));
+        var client = new NATPunchthroughClient();
+        const string STUN_SERVER = "stun.miwifi.com";
+        const int STUN_PORT = 3478;
+        await client.StartClientAsync(new IPEndPoint(Dns.GetHostAddresses(STUN_SERVER)[0],STUN_PORT));
     }
 }
