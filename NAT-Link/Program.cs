@@ -72,7 +72,10 @@ class Program
             // 获取公网地址
             publicIP = queryResult.PublicEndPoint.Address.ToString();
             publicPort = queryResult.PublicEndPoint.Port;
-
+            if (queryResult.NATType >= STUNNATType.Symmetric)
+            {
+                Console.WriteLine("你的 NAT 类型很差，打洞很有可能失败……");
+            }
             Console.WriteLine($"NAT类型: {queryResult.NATType}");
             Console.WriteLine($"公网地址: {publicIP}:{publicPort}");
         }
