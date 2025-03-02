@@ -9,6 +9,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Mono.Nat" Version="3.0.4" />
     <PackageReference Include="STUN" Version="0.5.0" />
   </ItemGroup>
 

@@ -1,229 +1,127 @@
 using System;
 using System.Net;
 using System.Net.Sockets;
-using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
-using System.Collections.Concurrent;
+using Mono.Nat;
 using STUN;
-using System.Runtime.CompilerServices;
 
-public class NATPunchthroughClient
+class Program
 {
-    private Socket _listener;
-    private readonly ConcurrentDictionary<string, TcpClient> _connections = new();
-    private CancellationTokenSource _cts = new();
+    static string publicIP;
+    static int publicPort;
+    static Socket udpSocket; // 改为直接使用Socket
+    static bool isMapped = false;
 
-    public async Task StartClientAsync(IPEndPoint StunServer)
+    static void Main(string[] args)
     {
-        try
+        // 创建并绑定Socket到随机端口
+        udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        udpSocket.Bind(new IPEndPoint(IPAddress.Any, 0)); // 随机端口
+        int localPort = ((IPEndPoint)udpSocket.LocalEndPoint).Port;
+
+        // 使用STUN获取公网IP和端口
+        GetPublicInfoWithSTUN();
+
+        // 使用Mono.Nat尝试UPnP端口映射（保持原逻辑）
+        TryUPnPMapping(localPort);
+
+        // 用户交互交换地址信息
+        Console.WriteLine($"您的公网地址: {publicIP}:{publicPort}");
+        Console.Write("请输入对方公网地址 (IP:端口): ");
+        string remoteInput = Console.ReadLine();
+        string[] remoteParts = remoteInput.Split(':');
+        IPEndPoint remoteEndPoint = new IPEndPoint(IPAddress.Parse(remoteParts[0]), int.Parse(remoteParts[1]));
+
+        // 启动接收线程
+        Thread receiveThread = new Thread(ReceiveMessages);
+        receiveThread.IsBackground = true;
+        receiveThread.Start();
+
+        // 发送打孔数据包
+        Console.WriteLine("正在尝试NAT打孔...");
+        byte[] punchPacket = System.Text.Encoding.UTF8.GetBytes("PUNCH");
+        udpSocket.SendTo(punchPacket, remoteEndPoint);
+
+        // 后续通信...
+        while (true)
         {
-            // 获取公网端点信息
-            var publicEP = await GetPublicEndPoint(StunServer);
-            Console.WriteLine($"Public endpoint: {publicEP.Item1}");
-
-            // 启动本地监听
-            _listener = publicEP.Item2.BeginAccept(new AsyncCallback(OnConnect),this);
-            //_ = Task.Run(() => ListenForIncomingConnections());
-
-            // 主命令循环
-            while (!_cts.IsCancellationRequested)
-            {
-                Console.Write("> ");
-                var input = Console.ReadLine();
-
-                switch (input)
-                {
-                    case "connect":
-                        Console.Write("请输入地址：");
-                        var parts = Console.ReadLine().Trim();
-                        IPEndPoint res;
-                        if (IPEndPoint.TryParse(parts, out res))
-                        {
-                            await ConnectToPeer(res.Address.ToString(), res.Port);
-                        }
-                        else
-                        {
-                            Console.WriteLine("错误的地址格式");
-                        }
-                        break;
-                    case "disconnect":
-                        Console.Write("请输入地址：");
-                        var addr = Console.ReadLine().Trim();
-                        if (_connections.TryRemove(addr, out var client))
-                        {
-                            client.Close();
-                            Console.WriteLine("已断开指定连接");
-                        }
-                        else
-                        {
-                            Console.WriteLine("未找到连接");
-                        }
-                        break;
-                    case "list":
-                        foreach (var key in _connections.Keys)
-                        {
-                            Console.WriteLine(key);
-                        }
-                        break;
-                    default:
-                        if (input == "exit")
-                        {
-                            break;
-                        }
-                        else
-                        {
-                            await BroadcastMessage(input);
-                        }
-                        break;
-                }
-                
-            }
-        }
-        finally
-        {
-            Cleanup();
+            string message = Console.ReadLine();
+            byte[] data = System.Text.Encoding.UTF8.GetBytes(message);
+            udpSocket.SendTo(data, remoteEndPoint);
         }
     }
 
-    private void OnConnect(IAsyncResult iar)
+    static void GetPublicInfoWithSTUN()
     {
-        Socket client = (Socket)iar.AsyncState;
         try
         {
-            var _newSocket =  client.Accept();
-            _newSocket.Send(Encoding.UTF8.GetBytes("Accepted"));
-        }
-        catch (Exception e)
-        {
-            Console.WriteLine(e.ToString());
-        }
-    }
+            // 解析STUN服务器地址（使用Google STUN）
+            IPAddress[] stunIPs = Dns.GetHostAddresses("stun.miwifi.com");
+            IPEndPoint stunServer = new IPEndPoint(stunIPs[0], 3478);
 
-    //private async Task ListenForIncomingConnections()
-    //{
-    //    while (!_cts.IsCancellationRequested)
-    //    {
-    //        var client = await _listener.AcceptTcpClientAsync();
-    //        Console.WriteLine($"收到来自 {client.Client.RemoteEndPoint} 的连接请求");
-
-    //        Console.WriteLine("已接受连接请求");
-    //        var key = ((IPEndPoint)client.Client.RemoteEndPoint).ToString();
-    //        _connections.TryAdd(key, client);
-    //        _ = Task.Run(() => HandleClient(client));
-    //        await client.Client.SendAsync(Encoding.UTF8.GetBytes("Accepted"));
-    //    }
-    //}
-
-    private async Task HandleClient(TcpClient client)
-    {
-        using (client)
-        using (var stream = client.GetStream())
-        {
-            var buffer = new byte[4096];
-            try
+            // 创建STUN客户端（直接使用Socket）
+            var queryResult = STUNClient.Query(stunServer, STUNQueryType.OpenNAT, false);
+            // 检查结果状态
+            if (queryResult is null)
             {
-                // 心跳包发送
-                var heartbeatTask = Task.Run(async () =>
-                {
-                    while (client.Connected)
-                    {
-                        await Task.Delay(30000);
-                        await stream.WriteAsync(Encoding.UTF8.GetBytes("\u0000"), _cts.Token);
-                    }
-                });
-
-                while (client.Connected)
-                {
-                    var bytesRead = await stream.ReadAsync(buffer, _cts.Token);
-                    if (bytesRead == 0) break;
-
-                    var message = Encoding.UTF8.GetString(buffer, 0, bytesRead);
-                    if (message == "\u0000") continue;  // 过滤心跳包
-
-                    if (message == "Accepted") Console.WriteLine("对方已同意连接");
-
-                    Console.WriteLine($"Received: {message}");
-                }
+                throw new Exception("STUN查询失败");
             }
-            catch (IOException)
-            {
-                Console.WriteLine($"用户 {client.Client.RemoteEndPoint} 断开的自己的连接");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"连接出错： {ex}");
-            }
-            finally
-            {
-                _connections.TryRemove(((IPEndPoint)client.Client.RemoteEndPoint).ToString(), out _);
-            }
-        }
-    }
+            udpSocket = queryResult.Socket;
 
-    private async Task ConnectToPeer(string ip, int port)
-    {
-        var client = new TcpClient();
-        try
-        {
-            await client.ConnectAsync(ip, port);
-            if (client.Connected)
-            {
-                var key = ((IPEndPoint)client.Client.RemoteEndPoint).ToString();
-                _connections.TryAdd(key, client);
-                _ = Task.Run(() => HandleClient(client));
-                Console.WriteLine("等待对方同意");
-            }
+
+            // 获取公网地址
+            publicIP = queryResult.PublicEndPoint.Address.ToString();
+            publicPort = queryResult.PublicEndPoint.Port;
+
+            Console.WriteLine($"NAT类型: {queryResult.NATType}");
+            Console.WriteLine($"公网地址: {publicIP}:{publicPort}");
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"连接失败： {ex.Message}");
-            client.Close();
+            Console.WriteLine($"STUN错误: {ex.Message}");
+            // 回退到本地地址
+            IPEndPoint localEP = (IPEndPoint)udpSocket.LocalEndPoint;
+            publicIP = localEP.Address.ToString();
+            publicPort = localEP.Port;
         }
     }
 
-    private async Task BroadcastMessage(string message)
+    static void TryUPnPMapping(int localPort)
     {
-        if (string.IsNullOrWhiteSpace(message)) return;
+        NatUtility.DeviceFound += (sender, args) =>
+        {
+            INatDevice device = args.Device;
+            try
+            {
+                device.CreatePortMap(new Mapping(Protocol.Udp, localPort, publicPort, 3600, "P2P Hole Punching"));
+                isMapped = true;
+                Console.WriteLine($"UPnP映射成功: {localPort} -> {publicPort}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"UPnP映射失败: {ex.Message}");
+            }
+        };
+        NatUtility.StartDiscovery();
+    }
 
-        var data = Encoding.UTF8.GetBytes(message);
-        foreach (var (key, client) in _connections)
+    static void ReceiveMessages()
+    {
+        byte[] buffer = new byte[1024];
+        EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+
+        while (true)
         {
             try
             {
-                if (client.Connected)
-                {
-                    await client.GetStream().WriteAsync(data, 0, data.Length, _cts.Token);
-                }
+                int received = udpSocket.ReceiveFrom(buffer, ref remoteEP);
+                string message = System.Text.Encoding.UTF8.GetString(buffer, 0, received);
+                Console.WriteLine($"来自 {remoteEP}: {message}");
             }
-            catch
+            catch (SocketException ex)
             {
-                _connections.TryRemove(key, out _);
+                Console.WriteLine($"接收错误: {ex.SocketErrorCode}");
             }
         }
-    }
-
-    private async Task<(EndPoint,Socket)> GetPublicEndPoint(IPEndPoint StunServer)
-    {
-        var res = await STUN.STUNClient.QueryAsync(StunServer, STUN.STUNQueryType.PublicIP,false);
-        return (res.PublicEndPoint,res.Socket);
-    }
-
-    private void Cleanup()
-    {
-        _cts.Cancel();
-        _listener?.Close();
-        foreach (var client in _connections.Values)
-        {
-            client.Close();
-        }
-    }
-
-    public static async Task Main(string[] args)
-    {
-        var client = new NATPunchthroughClient();
-        const string STUN_SERVER = "stun.miwifi.com";
-        const int STUN_PORT = 3478;
-        await client.StartClientAsync(new IPEndPoint(Dns.GetHostAddresses(STUN_SERVER)[0],STUN_PORT));
     }
 }
