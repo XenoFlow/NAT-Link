@@ -24,7 +24,7 @@ class Program
         GetPublicInfoWithSTUN();
 
         // 使用Mono.Nat尝试UPnP端口映射（保持原逻辑）
-        TryUPnPMapping(localPort);
+        //TryUPnPMapping(localPort);
 
         // 用户交互交换地址信息
         Console.WriteLine($"请将您的公网地址发送给他人: {publicIP}:{publicPort}");
@@ -79,9 +79,20 @@ class Program
             IPEndPoint stunServer = new IPEndPoint(stunIPs[0], 3478);
 
             // 创建STUN客户端（直接使用Socket）
-            var queryResult = STUNClient.Query(stunServer, STUNQueryType.OpenNAT, false);
+            var queryResult = STUNClient.Query(stunServer, STUNQueryType.ExactNAT,true);
             // 检查结果状态
-            if (queryResult is null)
+            if (queryResult.QueryError != STUNQueryError.Success)
+            {
+                throw new Exception("STUN查询失败");
+            }
+            // 检测 NAT 类型
+            if (queryResult.NATType >= STUNNATType.Symmetric)
+            {
+                Console.WriteLine("你的 NAT 类型很差，打洞很有可能失败……");
+            }
+            queryResult = STUNClient.Query(stunServer, STUNQueryType.OpenNAT,false);
+            // 检查结果状态
+            if (queryResult.QueryError != STUNQueryError.Success)
             {
                 throw new Exception("STUN查询失败");
             }
@@ -91,10 +102,7 @@ class Program
             // 获取公网地址
             publicIP = queryResult.PublicEndPoint.Address.ToString();
             publicPort = queryResult.PublicEndPoint.Port;
-            if (queryResult.NATType >= STUNNATType.Symmetric)
-            {
-                Console.WriteLine("你的 NAT 类型很差，打洞很有可能失败……");
-            }
+            
             Console.WriteLine($"NAT类型: {queryResult.NATType}");
             Console.WriteLine($"公网地址: {publicIP}:{publicPort}");
         }
